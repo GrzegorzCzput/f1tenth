@@ -6,6 +6,7 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Joy
 from std_msgs.msg import Float64
+import numpy as np 
 
 class JoyControl(Node):
     def __init__(self):
@@ -13,8 +14,12 @@ class JoyControl(Node):
         self.subscription = self.create_subscription(
             Joy,
             'joy',
-            self.listener_callback,
+            self.joy_callback,
             1)
+        
+        self.joy_incorrect_mode = False
+        self.watchdog_activated = False
+        self.watchdog_timer = self.create_timer(0.2, self.watchdog_callback)
         
         self.subscription  # prevent unused variable warning
         self.current_publisher = self.create_publisher(Float64, '/commands/motor/current', 10)
@@ -23,15 +28,25 @@ class JoyControl(Node):
         self.angle_publisher = self.create_publisher(Float64, '/commands/servo/position', 10)
         self.braking_publisher = self.create_publisher(Float64, '/commands/motor/brake', 10)
 
-        self.current_input_list = []
-
         self.zero_current_threshold_ = 0.1
         self.current = Float64()
         self.angle = Float64()
         self.braking_speed  = Float64()
         self.braking_speed.data = 0.0
-
         self.breaking = Float64()
+        self.MAX_CURRENT = 8.0
+        self.joy_last_update = self.get_clock().now()
+        
+        
+    def watchdog_callback(self):
+        t_now_s = self.get_clock().now().seconds_nanoseconds()[0] + self.get_clock().now().seconds_nanoseconds()[1] * 10e-9
+        t_update_s = self.joy_last_update.seconds_nanoseconds()[0] + self.joy_last_update.seconds_nanoseconds()[1] * 10e-9
+        if t_now_s - t_update_s  > 0.1:
+            self.watchdog_activated = True
+            #self.get_logger().info(f'watchdog activated')
+            self.breaking.data = 2000.0
+            self.braking_publisher.publish(self.breaking)
+            return
 
 
     def convert_to_servo_angle(self, joy_input):
@@ -43,43 +58,58 @@ class JoyControl(Node):
         return 0.5 - 0.35 * joy_input
 
     def convert_to_motor_current(self, joy_input):
-        # curent is between -1 and 1
-        # 1 -> 0.0
-        # -1 -> 7.5
- 
-        
-        return 4 * (1 - joy_input)
+        # 0 -> 0.0
+        # 1 -> MAX_CURRENT       
+        return self.MAX_CURRENT * joy_input
+    
     
     def braking_enabled(self, joy_input):
-        return joy_input < 0.0
+        return joy_input > 0.5
     
-    def repetetive_imput(self):
-        # if all the inputs are the same then return true
-        return len(set(self.current_input_list)) == 1
+    
+    def check_joy_msg_format(self, msg):
+        if len(msg.axes) != 8:
+            self.get_logger().info('Joy is in incorrect mode.')
+            self.joy_incorrect_mode = True
+           
+        if(np.isclose(msg.axes[6], 1.0) or np.isclose(msg.axes[7], 1.0)) or (np.isclose(msg.axes[6], -1.0) or np.isclose(msg.axes[7], -1.0)):
+            self.get_logger().info('Joy is in incorrect mode.')
+            self.joy_incorrect_mode = True
+            
 
 
-    def listener_callback(self, msg):
-        # on cable curent is on msg 5 and breaking is msg 2
-        self.angle.data = self.convert_to_servo_angle(msg.axes[0])
-        self.current.data = self.convert_to_motor_current(msg.axes[5])
-        self.get_logger().info('Input joy speed: "%s"' % msg.axes[5])
+    def joy_callback(self, msg):
+        self.check_joy_msg_format(msg)
 
-        self.current_input_list.append(self.current.data)
+        self.joy_last_update = self.get_clock().now() 
         
-        if len(self.current_input_list) > 4:
-            self.current_input_list.pop(0)
-
+        self.get_logger().info(f'self.joy_last_update: {self.joy_last_update}')
+        
+        joy_braking_input =  (- msg.axes[2] + 1.0) / 2.0 # 0.0 to 1.0
+        
+        joy_acceleration_input =  (- msg.axes[5] + 1.0) / 2.0 # 0.0 to 1.0
+        
+        steering_input = msg.axes[0]
+        
+        self.angle.data = self.convert_to_servo_angle(steering_input)
         self.angle_publisher.publish(self.angle)
-        if self.braking_enabled(msg.axes[2]):   
-
+        
+        self.current.data = self.convert_to_motor_current(joy_acceleration_input)
+        
+        if msg.buttons[0] and msg.buttons[1] and msg.buttons[2] and msg.buttons[3]:
+            self.watchdog_activated = False
+            self.joy_incorrect_mode = False
+            self.get_logger().info('resetting errors')  
+        
+        if self.braking_enabled(joy_braking_input) or self.watchdog_activated or self.joy_incorrect_mode:   
             self.breaking.data = 2000.0
             self.braking_publisher.publish(self.breaking)
-            self.get_logger().info('breaking')
+            self.get_logger().info(f'breaking {self.braking_enabled(joy_braking_input)} {self.watchdog_activated} {self.joy_incorrect_mode}')
         else:
             self.breaking.data = 0.0
-            # self.braking_publisher.publish(self.breaking)
-            self.get_logger().info('Current: "%s"' % self.current.data)
-            self.current_publisher.publish(self.current)
+            self.get_logger().info(f'current: {self.watchdog_activated} {self.current.data}')
+            #self.current_publisher.publish(self.current)
+
 
 
 def main(args=None):
